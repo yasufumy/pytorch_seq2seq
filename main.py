@@ -1,79 +1,95 @@
-import re
-import spacy
 from argparse import ArgumentParser
 
 import torch
 import torch.optim as optim
-# from torch.optim.lr_scheduler import StepLR
 from torchtext import data
-from torchtext import datasets
 
 from model import Seq2Seq
+from data import SmallEnJa
 
 
 parser = ArgumentParser()
 parser.add_argument('--epoch', type=int, default=100)
-parser.add_argument('--batch', type=int, default=128)
+parser.add_argument('--batch', type=int, default=64)
 parser.add_argument('--gpu', type=int, default=-1)
+parser.add_argument('--embed', type=int, default=512)
+parser.add_argument('--encoder-hidden', type=int, default=512)
+parser.add_argument('--decoder-hidden', type=int, default=512)
+parser.add_argument('--attention-type', type=str, default='general',
+                    choices=('general', 'mlp', 'dot'))
+parser.add_argument('--learning-rate', type=float, default=1e-3)
+parser.add_argument('--dropout-ratio', type=float, default=0.5)
+parser.add_argument('--weight-decay', type=float, default=1e-6)
+parser.add_argument('--gradient-clipping', type=int, default=5)
+parser.add_argument('--evaluation-step', type=int, default=3)
+parser.add_argument('--max-length', type=int, default=32)
 args = parser.parse_args()
 
 
-spacy_de = spacy.load('de')
-spacy_en = spacy.load('en')
+EN = data.Field(eos_token='</s>')
+JA = data.Field(init_token='<s>', eos_token='</s>')
 
-url = re.compile('(<url>.*</url>)')
-
-
-def tokenize_de(text):
-    return [tok.text for tok in spacy_de.tokenizer(url.sub('@URL@', text))]
+train, val, test = SmallEnJa.splits(exts=('.en', '.ja'), fields=(EN, JA))
 
 
-def tokenize_en(text):
-    return [tok.text for tok in spacy_en.tokenizer(url.sub('@URL@', text))]
+EN.build_vocab(train.src, max_size=4000)
+JA.build_vocab(train.trg, max_size=5000)
 
 
-DE = data.Field(tokenize=tokenize_de)
-EN = data.Field(tokenize=tokenize_en, init_token='<s>', eos_token='</s>')
+train_iter, val_iter, test_iter = data.BucketIterator.splits(
+    (train, val, test), batch_sizes=(args.batch, 512, 512), device=args.gpu)
 
-train, val, test = datasets.Multi30k.splits(exts=('.de', '.en'), fields=(DE, EN))
-
-
-DE.build_vocab(train.src, min_freq=3)
-EN.build_vocab(train.trg, min_freq=3)
-
-if args.gpu >= 0 and torch.cuda.is_available():
-    torch.cuda.set_device(args.gpu)
-
-
-train_iter, val_iter = data.BucketIterator.splits(
-    (train, val), batch_size=args.batch, device=args.gpu)
-
-stoi = EN.vocab.stoi
+stoi = JA.vocab.stoi
 model = Seq2Seq(
-    len(DE.vocab), 200, 100, 100, len(EN.vocab), 200,
-    DE.vocab.stoi[DE.pad_token], stoi[EN.pad_token])
-model.prepare_translation(stoi[EN.init_token], stoi[EN.eos_token], EN.vocab.itos, 50)
-if torch.cuda.is_available():
-    model.cuda()
+    len(EN.vocab), args.embed, args.encoder_hidden,
+    len(JA.vocab), args.embed, args.decoder_hidden,
+    EN.vocab.stoi[EN.pad_token], stoi[JA.pad_token], args.dropout_ratio,
+    args.attention_type)
+model.prepare_translation(
+    stoi[JA.init_token], stoi[JA.eos_token], JA.vocab.itos, args.max_length)
 
-# optimizer = optim.SGD(model.parameters(), lr=1)
-# scheduler = StepLR(optimizer, step_size=5, gamma=0.5)
-optimizer = optim.Adam(model.parameters())
+if args.gpu >= 0:
+    model.cuda(args.gpu)
 
-for i in range(1, args.epoch + 1):
-    sum_loss = 0
-    print('epoch: {}'.format(i))
-    # scheduler.step()
-    for batch in train_iter:
-        optimizer.zero_grad()
-        loss = model.compute_loss(batch.src, batch.trg)
-        loss.backward()
-        optimizer.step()
-        sum_loss += loss.data[0]
-        if train_iter.epoch >= i:
+optimizer = optim.Adam(
+    model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+
+max_bleu = -1
+sum_loss = 0
+max_epoch = args.epoch
+eval_step = args.evaluation_step
+previous_epoch = 0.
+
+print('start training')
+for batch in train_iter:
+    optimizer.zero_grad()
+    loss = model.compute_loss((batch.src, batch.trg))
+    loss.backward()
+    torch.nn.utils.clip_grad_norm(model.parameters(), args.gradient_clipping)
+    optimizer.step()
+    sum_loss += loss.data[0]
+    del loss, batch
+    # report loss
+    if train_iter.epoch // 1 != previous_epoch // 1:
+        print('epoch: {}'.format(train_iter.epoch))
+        print('loss: {}'.format(sum_loss))
+        sum_loss = 0
+    # evaluation
+    if train_iter.epoch // eval_step != previous_epoch // eval_step:
+        # evaluation model
+        model.eval()
+        bleu = model.evaluate(val_iter)
+        print('bleu: {}'.format(bleu))
+        if bleu > max_bleu:
+            max_bleu = bleu
+            torch.save(model.state_dict(), 'best.pt')
+        # back to training mode
+        model.train()
+    # stop training
+    if train_iter.epoch // max_epoch != previous_epoch // max_epoch:
             break
-    print('loss: {}'.format(sum_loss))
-    hyps = model.translate(batch.src)
-    print('ref: {}'.format(' '.join([EN.vocab.itos[t.data[0]] for t in batch.trg][1:])))
-    print('hyp: {}'.format(hyps[0]))
-    print('bleu: {}'.format(model.evaluate(val_iter)))
+    previous_epoch = train_iter.epoch
+
+model.load_state_dict(torch.load('best.pt'))
+model.eval()
+print('test score: {}'.format(model.evaluate(test_iter)))

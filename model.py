@@ -1,3 +1,5 @@
+from functools import partial
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as functional
@@ -6,137 +8,201 @@ from torch.autograd import Variable
 from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
 
 
-def make_zeros(*shape, **kwargs):
-    volatile = kwargs.pop('volatile', False)
-    zeros = Variable(torch.zeros(*shape), volatile=volatile)
-    if torch.cuda.is_available():
-        zeros = zeros.cuda()
-    return zeros
-
-
 def remove_id(ys, tag_id):
     if type(ys) is Variable:
         ys = ys.data
+    pick = partial(torch.topk, k=1) if ys.is_cuda else partial(torch.max, dim=0)
     result = []
     for y in ys:
         indices = y == tag_id
-        if any(indices):
-            # i = indices.max(0)[1][0]
-            i = indices.topk(1)[1][0]  # use topk insted of max
+        if indices.any():
+            i = pick(indices)[1][0]
             y = y[:i]
         result.append(y)
     return result
 
 
-class LSTMEncoder(nn.Module):
-    def __init__(self, hidden_size, embeddings):
+class Linear(nn.Linear):
+    def reset_parameters(self):
+        nn.init.xavier_uniform(self.weight)
+        if self.bias is not None:
+            nn.init.constant(self.bias, 0)
+
+
+class Embedding(nn.Embedding):
+    def reset_parameters(self):
+        nn.init.xavier_uniform(self.weight)
+        if self.padding_idx is not None:
+            self.weight.data[self.padding_idx].fill_(0)
+
+
+class LSTMCell(nn.LSTMCell):
+    def reset_parameters(self):
+        nn.init.xavier_uniform(self.weight_ih)
+        nn.init.xavier_uniform(self.weight_hh)
+        if self.bias:
+            nn.init.constant(self.bias_ih, 0)
+            nn.init.constant(self.bias_hh, 0)
+
+
+class BaseEncoder(nn.Module):
+    def init_state(self, variable, batch_size, hidden_size):
+        return Variable(
+            variable.data.new(batch_size, hidden_size).zero_().float(),
+            volatile=not self.training)
+
+
+class LSTMEncoder(BaseEncoder):
+    def __init__(self, hidden_size, embeddings, dropout_ratio=0.5):
         super().__init__()
 
         self.hidden_size = hidden_size
         self.embeddings = embeddings
-        self.lstm = nn.LSTMCell(embeddings.embedding_dim, hidden_size)
+        self.lstm = LSTMCell(embeddings.embedding_dim, hidden_size)
+        self.dropout_ratio = dropout_ratio
 
-    def forward(self, xs, rnn_name=None):
-        if rnn_name is None:
-            rnn = getattr(self, 'lstm')
-        else:
-            rnn = getattr(self, rnn_name)
-        length, batch_size = xs.size()
-        h = m = make_zeros(batch_size, self.hidden_size)
+    def forward(self, xs):
+        embs = functional.dropout(self.embeddings(xs), p=self.dropout_ratio)
+        return self._recurrent(embs, lstm=self.lstm)
+
+    def _recurrent(self, embs, lstm, reverse=False):
+        length, batch_size, _ = embs.size()
+        h = m = self.init_state(embs, batch_size, self.hidden_size)
+        steps = range(length - 1, -1, -1) if reverse else range(length)
         hs = []
-        for x in xs:
-            emb = self.embeddings(x)
-            h, m = rnn(emb, (h, m))
-            hs.append(h)
+        for i in steps:
+            h, m = lstm(embs[i], (h, m))
+            hs.append(functional.dropout(h, p=self.dropout_ratio))
+        if reverse:
+            hs.reverse()
         return torch.cat(hs, 0).view(length, batch_size, -1)
 
 
 class BiLSTMEncoder(LSTMEncoder):
-    def __init__(self, hidden_size, embeddings):
-        super().__init__(hidden_size, embeddings)
+    def __init__(self, hidden_size, embeddings, dropout_ratio=0.5):
+        super(LSTMEncoder, self).__init__()
 
-        # for backward
-        self.lstm2 = nn.LSTMCell(embeddings.embedding_dim, hidden_size)
+        self.hidden_size = hidden_size
+        self.embeddings = embeddings
+        self.lstm_forward = LSTMCell(embeddings.embedding_dim, hidden_size)
+        self.lstm_backward = LSTMCell(embeddings.embedding_dim, hidden_size)
+        self.dropout_ratio = dropout_ratio
 
     def forward(self, xs):
-        hs_forward = super().forward(xs)
-        inverse_index = torch.arange(xs.size(0) - 1, -1, -1).long()
-        if torch.cuda.is_available():
-            inverse_index = inverse_index.cuda()
-        hs_backward = super().forward(xs[inverse_index], 'lstm2')[inverse_index]
+        embs = functional.dropout(self.embeddings(xs), p=self.dropout_ratio)
+        hs_forward = super()._recurrent(embs, lstm=self.lstm_forward)
+        hs_backward = super()._recurrent(embs, lstm=self.lstm_backward, reverse=True)
         return torch.cat((hs_forward, hs_backward), 2)
 
 
-class MLPAttention(nn.Module):
+class BaseAttention(nn.Module):
+    def forward(self, query, hs):
+        scores = self.score(query, hs)
+        ps = functional.softmax(scores, dim=1).unsqueeze(1)
+        return torch.bmm(ps, hs).view(query.size(0), -1)
+
+    def score(self, query, hs):
+        raise NotImplementedError
+
+
+class MLPAttention(BaseAttention):
     def __init__(self, query_size, hidden_size):
         super().__init__()
 
-        self.linear = nn.Linear(query_size + hidden_size, hidden_size, bias=False)
-        self.v = nn.Linear(hidden_size, 1, bias=False)
+        self.linear = Linear(query_size + hidden_size, hidden_size, bias=False)
+        self.v = Linear(hidden_size, 1, bias=False)
 
-    def forward(self, query, hs):
-        ps = self.align(query, hs)
-        return torch.bmm(ps, hs).view(query.size(0), -1)
-
-    def align(self, query, hs):
-        batch_size, query_size = query.size()
-        batch_size, length, hidden_size = hs.size()
-        query = query.view(batch_size, 1, query_size).expand(
-            batch_size, length, query_size)
+    def score(self, query, hs):
+        _, query_size = query.size()
+        _, length, hidden_size = hs.size()
+        query = query.unsqueeze(1).expand(-1, length, query_size)
         linear_in = torch.cat((query, hs), 2).view(-1, query_size + hidden_size)
-        score = self.v(torch.tanh(self.linear(linear_in))).view(batch_size, length)
-        return functional.softmax(score).view(batch_size, 1, length)
+        return self.v(torch.tanh(self.linear(linear_in))).view(-1, length)
 
 
-class LSTMDecoder(nn.Module):
-    def __init__(self, encoder_hidden_size, decoder_hidden_size, embeddings, attention):
+class GeneralAttention(BaseAttention):
+    def __init__(self, query_size, hidden_size):
+        super().__init__()
+
+        self.linear = Linear(query_size, hidden_size, bias=False)
+
+    def score(self, query, hs):
+        return torch.bmm(hs, self.linear(query).unsqueeze(2)).squeeze(2)
+
+
+class DotAttention(BaseAttention):
+    def __init__(self, query_size, hidden_size):
+        super().__init__()
+
+        if query_size != hidden_size:
+            raise ValueError('query_size and hidden_size should be equal')
+
+    def score(self, query, hs):
+        return torch.bmm(hs, query.unsqueeze(2)).squeeze(2)
+
+
+class LSTMDecoder(BaseEncoder):
+    def __init__(self, encoder_hidden_size, decoder_hidden_size, embeddings,
+                 attention, dropout_ratio=0.5):
         super().__init__()
 
         self.embeddings = embeddings
         self.attention = attention
         self.hidden_size = decoder_hidden_size
-        self.lstm = nn.LSTMCell(
+        self.lstm = LSTMCell(
             embeddings.embedding_dim + decoder_hidden_size, decoder_hidden_size)
-        self.linear = nn.Linear(
+        self.linear = Linear(
             decoder_hidden_size + encoder_hidden_size, decoder_hidden_size)
-        self.linear_out = nn.Linear(decoder_hidden_size, embeddings.num_embeddings)
+        self.linear_out = Linear(decoder_hidden_size, embeddings.num_embeddings)
+        self.dropout_ratio = dropout_ratio
 
     def forward_step(self, y, h, m, o, hs):
-        emb = self.embeddings(y)
+        emb = functional.dropout(self.embeddings(y), p=self.dropout_ratio)
         h, m = self.lstm(torch.cat((emb, o), 1), (h, m))
+        h = functional.dropout(h, p=self.dropout_ratio)
         c = self.attention(h, hs)
         o = functional.tanh(self.linear(torch.cat((c, h), 1)))
         return self.linear_out(h), h, m, o
 
     def forward(self, ts, hs):
         length, batch_size = ts.size()
-        h = m = o = make_zeros(batch_size, self.hidden_size)
+        h = m = o = self.init_state(ts, batch_size, self.hidden_size)
         hs = hs.transpose(0, 1)  # transpose for attention
         ys = []
         for t in ts:
             y, h, m, o = self.forward_step(t, h, m, o, hs)
             ys.append(y)
         ys = torch.cat(ys, 0)
-        return functional.log_softmax(ys).view(length, batch_size, -1)
+        return functional.log_softmax(ys, dim=1).view(length, batch_size, -1)
 
 
 class Seq2Seq(nn.Module):
     def __init__(self, source_vocab_size, source_embed_size,  encoder_hidden_size,
-                 decoder_hidden_size, target_vocab_size, target_embed_size,
-                 encoder_pad_index, decoder_pad_index):
+                 target_vocab_size, target_embed_size, decoder_hidden_size,
+                 encoder_pad_index, decoder_pad_index, dropout_ratio=0.5,
+                 attention_type='general'):
         super().__init__()
 
-        source_embedding = nn.Embedding(
+        source_embedding = Embedding(
             source_vocab_size, source_embed_size, padding_idx=encoder_pad_index)
-        self.encoder = BiLSTMEncoder(encoder_hidden_size, source_embedding)
-        target_embedding = nn.Embedding(
+        self.encoder = BiLSTMEncoder(
+            encoder_hidden_size, source_embedding, dropout_ratio)
+        target_embedding = Embedding(
             target_vocab_size, target_embed_size, padding_idx=decoder_pad_index)
-        attention = MLPAttention(decoder_hidden_size, 2 * encoder_hidden_size)
+        if attention_type == 'general':
+            attention = GeneralAttention(decoder_hidden_size, 2 * encoder_hidden_size)
+        elif attention_type == 'mlp':
+            attention = MLPAttention(decoder_hidden_size, 2 * encoder_hidden_size)
+        elif attention_type == 'dot':
+            attention = DotAttention(decoder_hidden_size, 2 * encoder_hidden_size)
+        else:
+            raise ValueError('attention_type should be "general" or "mlp" or "dot".')
         self.decoder = LSTMDecoder(2 * encoder_hidden_size, decoder_hidden_size,
-                                   target_embedding, attention)
+                                   target_embedding, attention, dropout_ratio)
         self.nll_loss = nn.NLLLoss(ignore_index=decoder_pad_index)
 
-    def compute_loss(self, xs, ts):
+    def compute_loss(self, batch):
+        xs, ts = batch
         hs = self.encoder(xs)
         ts_in = ts[:-1]  # ignore eos
         ys = self.decoder(ts_in, hs)
@@ -154,15 +220,16 @@ class Seq2Seq(nn.Module):
         batch_size = xs.size(1)
         hs = self.encoder(xs)
         hs = hs.transpose(0, 1)  # transpose for attention
-        y = Variable(torch.LongTensor([self.bos_id] * batch_size), volatile=True)
-        if torch.cuda.is_available():
-            y = y.cuda()
-        h = m = o = make_zeros(batch_size, self.decoder.hidden_size, volatile=True)
+        y = Variable(
+            xs.data.new(batch_size).fill_(self.bos_id), volatile=True)
+        h = m = o = self.decoder.init_state(
+            xs, batch_size, self.decoder.hidden_size)
         ys = []
+        # decoding
         for _ in range(self.max_length):
             y, h, m, o = self.decoder.forward_step(y, h, m, o, hs)
             y = y.topk(1)[1].view(-1)
-            if all(y.data == self.eos_id):
+            if (y.data == self.eos_id).all():
                 break
             ys.append(y.data)
         # transpose
@@ -183,9 +250,9 @@ class Seq2Seq(nn.Module):
         for batch in val_iter:
             xs = batch.src
             ts = batch.trg
-            hyp += self.translate(xs, as_string=False)
+            hyp += [y.tolist() for y in self.translate(xs, as_string=False)]
             ts = ts.transpose(0, 1)
             ts = remove_id(ts, self.eos_id)
-            ref += [[t] for t in ts]
+            ref += [[t.tolist()] for t in ts]
         return corpus_bleu(
             ref, hyp, smoothing_function=SmoothingFunction().method1) * 100
