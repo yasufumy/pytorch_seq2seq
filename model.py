@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as functional
 from torch.autograd import Variable
+from torch.distributions import Categorical
 
 from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
 
@@ -96,18 +97,39 @@ class BiLSTMEncoder(LSTMEncoder):
 
 
 class BaseAttention(nn.Module):
+    def __init__(self, mode='soft'):
+        super().__init__()
+
+        if mode == 'soft':
+            self._forward = self._soft_forward
+        elif mode == 'hard':
+            self._forward = self._hard_forward
+        else:
+            raise ValueError('mode should be soft or hard.')
+
+    @staticmethod
+    def _soft_forward(ps, hs):
+        return torch.bmm(ps.unsqueeze(1), hs).squeeze(1)
+
+    @staticmethod
+    def _hard_forward(ps, hs):
+        batch_size = ps.size(0)
+        positions = Categorical(ps).sample()
+        indices = positions.data.new(range(batch_size))
+        return hs[indices, positions]
+
     def forward(self, query, hs):
         scores = self.score(query, hs)
-        ps = functional.softmax(scores, dim=1).unsqueeze(1)
-        return torch.bmm(ps, hs).view(query.size(0), -1)
+        ps = functional.softmax(scores, dim=1)
+        return self._forward(ps, hs)
 
     def score(self, query, hs):
         raise NotImplementedError
 
 
 class MLPAttention(BaseAttention):
-    def __init__(self, query_size, hidden_size):
-        super().__init__()
+    def __init__(self, query_size, hidden_size, mode='soft'):
+        super().__init__(mode)
 
         self.linear = Linear(query_size + hidden_size, hidden_size, bias=False)
         self.v = Linear(hidden_size, 1, bias=False)
@@ -121,8 +143,8 @@ class MLPAttention(BaseAttention):
 
 
 class GeneralAttention(BaseAttention):
-    def __init__(self, query_size, hidden_size):
-        super().__init__()
+    def __init__(self, query_size, hidden_size, mode='soft'):
+        super().__init__(mode)
 
         self.linear = Linear(query_size, hidden_size, bias=False)
 
@@ -131,8 +153,8 @@ class GeneralAttention(BaseAttention):
 
 
 class DotAttention(BaseAttention):
-    def __init__(self, query_size, hidden_size):
-        super().__init__()
+    def __init__(self, query_size, hidden_size, mode='hard'):
+        super().__init__(mode)
 
         if query_size != hidden_size:
             raise ValueError('query_size and hidden_size should be equal')
