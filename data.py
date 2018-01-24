@@ -6,6 +6,10 @@ class SmallEnJa(TranslationDataset):
     name = 'smallenja'
     dirname = 'small_parallel_enja-master'
 
+    @staticmethod
+    def sort_key(ex):
+        return -len(ex.src)
+
     @classmethod
     def splits(cls, exts, fields, root='.data', train='train', validation='dev',
                test='test', **kwargs):
