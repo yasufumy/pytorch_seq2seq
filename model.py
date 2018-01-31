@@ -4,23 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as functional
 from torch.autograd import Variable
-from torch.distributions import Categorical
-
-from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
-
-
-def remove_id(ys, tag_id):
-    if type(ys) is Variable:
-        ys = ys.data
-    pick = partial(torch.topk, k=1) if ys.is_cuda else partial(torch.max, dim=0)
-    result = []
-    for y in ys:
-        indices = y == tag_id
-        if indices.any():
-            i = pick(indices)[1][0]
-            y = y[:i]
-        result.append(y)
-    return result
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 
 class Linear(nn.Linear):
@@ -37,99 +21,60 @@ class Embedding(nn.Embedding):
             self.weight.data[self.padding_idx].fill_(0)
 
 
-class LSTMCell(nn.LSTMCell):
+class LSTM(nn.LSTM):
     def reset_parameters(self):
-        nn.init.xavier_uniform(self.weight_ih)
-        nn.init.xavier_uniform(self.weight_hh)
-        if self.bias:
-            nn.init.constant(self.bias_ih, 0)
-            nn.init.constant(self.bias_hh, 0)
+        for name, param in self.named_parameters():
+            if 'weight' in name:
+                nn.init.xavier_uniform(param)
+            elif 'bias' in name:
+                nn.init.constant(param, 0)
 
 
-class BaseEncoder(nn.Module):
-    def init_state(self, variable, batch_size, hidden_size):
-        return Variable(
-            variable.data.new(batch_size, hidden_size).zero_().float(),
-            volatile=not self.training)
-
-
-class LSTMEncoder(BaseEncoder):
-    def __init__(self, hidden_size, embeddings, dropout_ratio=0.5):
+class LSTMEncoder(nn.Module):
+    def __init__(self, hidden_size, embeddings, dropout_ratio=0.5,
+                 bidirectional=False, num_layers=1):
         super().__init__()
 
         self.hidden_size = hidden_size
         self.embeddings = embeddings
-        self.lstm = LSTMCell(embeddings.embedding_dim, hidden_size)
+        self.lstm = LSTM(embeddings.embedding_dim, hidden_size,
+                         dropout=dropout_ratio, bidirectional=bidirectional,
+                         num_layers=num_layers)
         self.dropout_ratio = dropout_ratio
 
-    def forward(self, xs):
+    def forward(self, xs, lengths):
+        self.lstm.flatten_parameters()
         embs = functional.dropout(self.embeddings(xs), p=self.dropout_ratio)
-        return self._recurrent(embs, lstm=self.lstm)
-
-    def _recurrent(self, embs, lstm, reverse=False):
-        length, batch_size, _ = embs.size()
-        h = m = self.init_state(embs, batch_size, self.hidden_size)
-        steps = range(length - 1, -1, -1) if reverse else range(length)
-        hs = []
-        for i in steps:
-            h, m = lstm(embs[i], (h, m))
-            hs.append(functional.dropout(h, p=self.dropout_ratio))
-        if reverse:
-            hs.reverse()
-        return torch.cat(hs, 0).view(length, batch_size, -1)
-
-
-class BiLSTMEncoder(LSTMEncoder):
-    def __init__(self, hidden_size, embeddings, dropout_ratio=0.5):
-        super(LSTMEncoder, self).__init__()
-
-        self.hidden_size = hidden_size
-        self.embeddings = embeddings
-        self.lstm_forward = LSTMCell(embeddings.embedding_dim, hidden_size)
-        self.lstm_backward = LSTMCell(embeddings.embedding_dim, hidden_size)
-        self.dropout_ratio = dropout_ratio
-
-    def forward(self, xs):
-        embs = functional.dropout(self.embeddings(xs), p=self.dropout_ratio)
-        hs_forward = super()._recurrent(embs, lstm=self.lstm_forward)
-        hs_backward = super()._recurrent(embs, lstm=self.lstm_backward, reverse=True)
-        return torch.cat((hs_forward, hs_backward), 2)
+        lengths = lengths.view(-1).tolist()
+        packed_embs = pack_padded_sequence(embs, lengths)
+        hs, state = self.lstm(packed_embs)
+        hs = pad_packed_sequence(hs)[0]
+        return hs, state
 
 
 class BaseAttention(nn.Module):
-    def __init__(self, mode='soft'):
-        super().__init__()
-
-        if mode == 'soft':
-            self._forward = self._soft_forward
-        elif mode == 'hard':
-            self._forward = self._hard_forward
-        else:
-            raise ValueError('mode should be soft or hard.')
-
-    @staticmethod
-    def _soft_forward(ps, hs):
-        return torch.bmm(ps.unsqueeze(1), hs).squeeze(1)
-
-    @staticmethod
-    def _hard_forward(ps, hs):
-        batch_size = ps.size(0)
-        positions = Categorical(ps).sample()
-        indices = positions.data.new(range(batch_size))
-        return hs[indices, positions]
 
     def forward(self, query, hs):
         scores = self.score(query, hs)
+        scores.data.masked_fill_(self.mask, -1024)
         ps = functional.softmax(scores, dim=1)
-        return self._forward(ps, hs)
+        return torch.bmm(ps.unsqueeze(1), hs).squeeze(1)
 
     def score(self, query, hs):
         raise NotImplementedError
 
+    def set_mask(self, src_lengths):
+        src_lengths = src_lengths.view(-1)
+        batch_size = src_lengths.numel()
+        max_length = src_lengths.max()
+        self.mask = torch.arange(0, max_length).\
+            type_as(src_lengths).repeat(batch_size, 1).\
+            ge(src_lengths.unsqueeze(1))
 
-class MLPAttention(BaseAttention):
-    def __init__(self, query_size, hidden_size, mode='soft'):
-        super().__init__(mode)
+
+class ConcatAttention(BaseAttention):
+    def __init__(self, query_size, hidden_size):
+        super().__init__()
 
         self.linear = Linear(query_size + hidden_size, hidden_size, bias=False)
         self.v = Linear(hidden_size, 1, bias=False)
@@ -143,8 +88,8 @@ class MLPAttention(BaseAttention):
 
 
 class GeneralAttention(BaseAttention):
-    def __init__(self, query_size, hidden_size, mode='soft'):
-        super().__init__(mode)
+    def __init__(self, query_size, hidden_size):
+        super().__init__()
 
         self.linear = Linear(query_size, hidden_size, bias=False)
 
@@ -153,8 +98,8 @@ class GeneralAttention(BaseAttention):
 
 
 class DotAttention(BaseAttention):
-    def __init__(self, query_size, hidden_size, mode='hard'):
-        super().__init__(mode)
+    def __init__(self, query_size, hidden_size):
+        super().__init__()
 
         if query_size != hidden_size:
             raise ValueError('query_size and hidden_size should be equal')
@@ -163,72 +108,80 @@ class DotAttention(BaseAttention):
         return torch.bmm(hs, query.unsqueeze(2)).squeeze(2)
 
 
-class LSTMDecoder(BaseEncoder):
-    def __init__(self, encoder_hidden_size, decoder_hidden_size, embeddings,
-                 attention, dropout_ratio=0.5):
+class LSTMDecoder(nn.Module):
+    def __init__(self, encoder_hidden_size, decoder_hidden_size, embeddings, attention,
+                 dropout_ratio=0.5, num_layers=1):
         super().__init__()
 
         self.embeddings = embeddings
         self.attention = attention
         self.hidden_size = decoder_hidden_size
-        self.lstm = LSTMCell(
-            embeddings.embedding_dim + decoder_hidden_size, decoder_hidden_size)
-        self.linear = Linear(
-            decoder_hidden_size + encoder_hidden_size, decoder_hidden_size)
-        self.linear_out = Linear(decoder_hidden_size, embeddings.num_embeddings)
+        self.lstm = LSTM(embeddings.embedding_dim + decoder_hidden_size, decoder_hidden_size,
+                         dropout=dropout_ratio, bidirectional=False, num_layers=num_layers)
+        total_hidden_size = decoder_hidden_size + encoder_hidden_size
+        self.linear = Linear(total_hidden_size, decoder_hidden_size)
+        self.output = Linear(decoder_hidden_size, embeddings.num_embeddings)
         self.dropout_ratio = dropout_ratio
+        self.num_layers = num_layers
+        self.num_directions = 1
 
-    def forward_step(self, y, h, m, o, hs):
-        emb = functional.dropout(self.embeddings(y), p=self.dropout_ratio)
-        h, m = self.lstm(torch.cat((emb, o), 1), (h, m))
-        h = functional.dropout(h, p=self.dropout_ratio)
+    def forward_step(self, y, state, hs, feed):
+        emb = self.embeddings(y)
+        h, state = self.lstm(
+            torch.cat((emb, feed), 1).unsqueeze(0), state)
+        h = functional.dropout(h.squeeze(0), p=self.dropout_ratio)
         c = self.attention(h, hs)
-        o = functional.tanh(self.linear(torch.cat((c, h), 1)))
-        return self.linear_out(h), h, m, o
+        feed = functional.tanh(self.linear(torch.cat((c, h), 1)))
+        return self.output(feed), state, feed
 
-    def forward(self, ts, hs):
+    def forward(self, ts, hs, encoder_state):
+        self.lstm.flatten_parameters()
         length, batch_size = ts.size()
-        h = m = o = self.init_state(ts, batch_size, self.hidden_size)
-        hs = hs.transpose(0, 1)  # transpose for attention
+        feed = Variable(ts.data.new(batch_size, self.hidden_size).zero_().float(),
+                        volatile=not self.training)
+        state = None
+        hs = hs.transpose(1, 0)  # transpose for attention
         ys = []
         for t in ts:
-            y, h, m, o = self.forward_step(t, h, m, o, hs)
+            y, state, feed = self.forward_step(t, state, hs, feed)
             ys.append(y)
         ys = torch.cat(ys, 0)
-        return functional.log_softmax(ys, dim=1).view(length, batch_size, -1)
+        return functional.log_softmax(ys, dim=1).view(length * batch_size, -1)
 
 
 class Seq2Seq(nn.Module):
-    def __init__(self, source_vocab_size, source_embed_size,  encoder_hidden_size,
+    def __init__(self, source_vocab_size, source_embed_size, encoder_hidden_size,
                  target_vocab_size, target_embed_size, decoder_hidden_size,
+                 encoder_layers, encoder_bidirectional, decoder_layers,
                  encoder_pad_index, decoder_pad_index, dropout_ratio=0.5,
                  attention_type='general'):
         super().__init__()
 
-        source_embedding = Embedding(
-            source_vocab_size, source_embed_size, padding_idx=encoder_pad_index)
-        self.encoder = BiLSTMEncoder(
-            encoder_hidden_size, source_embedding, dropout_ratio)
-        target_embedding = Embedding(
-            target_vocab_size, target_embed_size, padding_idx=decoder_pad_index)
+        source_embedding = Embedding(source_vocab_size, source_embed_size, padding_idx=encoder_pad_index)
+        self.encoder = LSTMEncoder(encoder_hidden_size, source_embedding, dropout_ratio,
+                                   bidirectional=encoder_bidirectional, num_layers=encoder_layers)
+        target_embedding = Embedding(target_vocab_size, target_embed_size, padding_idx=decoder_pad_index)
+        in_size = encoder_hidden_size * (2 if encoder_bidirectional else 1)
         if attention_type == 'general':
-            attention = GeneralAttention(decoder_hidden_size, 2 * encoder_hidden_size)
-        elif attention_type == 'mlp':
-            attention = MLPAttention(decoder_hidden_size, 2 * encoder_hidden_size)
+            attention = GeneralAttention(decoder_hidden_size, in_size)
+        elif attention_type == 'concat':
+            attention = ConcatAttention(decoder_hidden_size, in_size)
         elif attention_type == 'dot':
-            attention = DotAttention(decoder_hidden_size, 2 * encoder_hidden_size)
+            attention = DotAttention(decoder_hidden_size, in_size)
         else:
-            raise ValueError('attention_type should be "general" or "mlp" or "dot".')
-        self.decoder = LSTMDecoder(2 * encoder_hidden_size, decoder_hidden_size,
-                                   target_embedding, attention, dropout_ratio)
-        self.nll_loss = nn.NLLLoss(ignore_index=decoder_pad_index)
+            raise ValueError('attention_type should be "general" or "concat" or "dot".')
+        self.decoder = LSTMDecoder(in_size, decoder_hidden_size, target_embedding, attention,
+                                   dropout_ratio, num_layers=decoder_layers)
+        self.nll_loss = nn.NLLLoss(ignore_index=decoder_pad_index, reduce=False)
 
-    def compute_loss(self, batch):
-        xs, ts = batch
-        hs = self.encoder(xs)
+    def compute_loss(self, xs, lengths, ts):
+        # encode
+        hs, encoder_state = self.encoder(xs, lengths.data)
         ts_in = ts[:-1]  # ignore eos
-        ys = self.decoder(ts_in, hs)
-        ys = ys.view(-1, ys.size(2))
+        # decode
+        self.decoder.attention.set_mask(lengths.data)
+        ys = self.decoder(ts_in, hs, encoder_state)
+        # loss
         ts_out = ts[1:].view(-1)  # ignore bos
         return self.nll_loss(ys, ts_out)
 
@@ -238,18 +191,20 @@ class Seq2Seq(nn.Module):
         self.id_to_token = id_to_token
         self.max_length = max_length
 
-    def translate(self, xs, as_string=True):
+    def translate(self, xs, lengths):
         batch_size = xs.size(1)
-        hs = self.encoder(xs)
-        hs = hs.transpose(0, 1)  # transpose for attention
-        y = Variable(
-            xs.data.new(batch_size).fill_(self.bos_id), volatile=True)
-        h = m = o = self.decoder.init_state(
-            xs, batch_size, self.decoder.hidden_size)
+        hs, _ = self.encoder(xs, lengths)
+        hs = hs.transpose(1, 0)  # transpose for attention
+        y = Variable(xs.data.new(batch_size).fill_(self.bos_id), volatile=True)
+        self.decoder.attention.set_mask(lengths)
+        feed = Variable(xs.data.new(batch_size, self.decoder.hidden_size).zero_().float(),
+                        volatile=not self.training)
+        state = None
         ys = []
         # decoding
+        self.decoder.lstm.flatten_parameters()
         for _ in range(self.max_length):
-            y, h, m, o = self.decoder.forward_step(y, h, m, o, hs)
+            y, state, feed = self.decoder.forward_step(y, state, hs, feed)
             y = y.topk(1)[1].view(-1)
             if (y.data == self.eos_id).all():
                 break
@@ -257,24 +212,16 @@ class Seq2Seq(nn.Module):
         # transpose
         ys = torch.cat(ys, 0).view(-1, batch_size).transpose(0, 1)
         # remove eos id
-        ys = remove_id(ys, self.eos_id)
-        if as_string:
-            # convert to readable sentences
-            id_to_token = self.id_to_token
-            sentences = [' '.join([id_to_token[i] for i in y]) for y in ys]
-            return sentences
-        else:
-            return ys
-
-    def evaluate(self, val_iter):
-        hyp = []
-        ref = []
-        for batch in val_iter:
-            xs = batch.src
-            ts = batch.trg
-            hyp += [y.tolist() for y in self.translate(xs, as_string=False)]
-            ts = ts.transpose(0, 1)
-            ts = remove_id(ts, self.eos_id)
-            ref += [[t.tolist()] for t in ts]
-        return corpus_bleu(
-            ref, hyp, smoothing_function=SmoothingFunction().method1) * 100
+        pick = partial(torch.topk, k=1) if ys.is_cuda else partial(torch.max, dim=0)
+        eos_id = self.eos_id
+        results = []
+        for y in ys:
+            indices = y == eos_id
+            if indices.any():
+                i = pick(indices)[1][0]
+                y = y[:i]
+            results.append(y)
+        # convert to readable sentences
+        id_to_token = self.id_to_token
+        sentences = [[id_to_token[i] for i in y] for y in results]
+        return sentences
