@@ -8,7 +8,7 @@ class SmallEnJa(TranslationDataset):
 
     @staticmethod
     def sort_key(ex):
-        return -len(ex.src)
+        return len(ex.src)
 
     @classmethod
     def splits(cls, exts, fields, root='.data', train='train', validation='dev',
