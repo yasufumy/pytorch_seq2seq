@@ -49,10 +49,9 @@ def main(args, logger):
     model.prepare_translation(stoi[TRG.init_token], stoi[TRG.eos_token],
                               TRG.vocab.itos, args.max_length)
 
-    compute_loss = model.compute_loss
     translate = model.translate
     if len(args.gpu) >= 2:
-        compute_loss = DataParallel(compute_loss, device_ids=args.gpu, dim=1)
+        model = DataParallel(model, device_ids=args.gpu, dim=1)
     if args.gpu:
         model.cuda(args.gpu[0])
 
@@ -60,8 +59,8 @@ def main(args, logger):
                            weight_decay=args.weight_decay)
 
     trainer = Trainer(
-        TeacherForceUpdater(model, optimizer, compute_loss, args.gradient_clipping),
-        TeacherForceInference(model, compute_loss))
+        TeacherForceUpdater(model, optimizer, model, args.gradient_clipping),
+        TeacherForceInference(model, model))
     trainer.add_event_handler(TrainingEvents.EPOCH_COMPLETED,
                               Validate(val_iter, epoch_interval=1))
     trainer.add_event_handler(TrainingEvents.TRAINING_EPOCH_COMPLETED,

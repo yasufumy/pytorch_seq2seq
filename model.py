@@ -174,7 +174,7 @@ class Seq2Seq(nn.Module):
                                    dropout_ratio, num_layers=decoder_layers)
         self.nll_loss = nn.NLLLoss(ignore_index=decoder_pad_index, reduce=False)
 
-    def compute_loss(self, xs, lengths, ts):
+    def forward(self, xs, lengths, ts):
         # encode
         hs, encoder_state = self.encoder(xs, lengths.data)
         ts_in = ts[:-1]  # ignore eos
@@ -183,7 +183,7 @@ class Seq2Seq(nn.Module):
         ys = self.decoder(ts_in, hs, encoder_state)
         # loss
         ts_out = ts[1:].view(-1)  # ignore bos
-        return self.nll_loss(ys, ts_out)
+        return self.nll_loss(ys, ts_out).unsqueeze(1)
 
     def prepare_translation(self, bos_id, eos_id, id_to_token, max_length):
         self.bos_id = bos_id
