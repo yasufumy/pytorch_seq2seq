@@ -14,10 +14,13 @@ from data import SmallEnJa
 from utils import log_training_average_nll, get_log_validation_ppl, \
     TeacherForceUpdater, TeacherForceInference, ComputeBleu, BestModelSnapshot
 
+BOS = '<s>'
+EOS = '</s>'
+
 
 def main(args, logger):
-    SRC = data.Field(init_token='<s>', eos_token='</s>', include_lengths=True)
-    TRG = data.Field(init_token='<s>', eos_token='</s>')
+    SRC = data.Field(init_token=BOS, eos_token=EOS, include_lengths=True)
+    TRG = data.Field(init_token=BOS, eos_token=EOS)
 
     if args.dataset == 'enja':
         train, val, test = SmallEnJa.splits(
@@ -34,11 +37,11 @@ def main(args, logger):
 
     train_iter, val_iter = data.BucketIterator.splits(
         (train, val), batch_sizes=(args.batch, args.batch * 2), repeat=False,
-        sort_within_batch=True, device=args.gpu[0] if args.gpu else None,
-        sort_key=SmallEnJa.sort_key)
+        sort_within_batch=True, sort_key=SmallEnJa.sort_key,
+        device=args.gpu[0] if len(args.gpu) == 1 else -1)
     test_iter = data.Iterator(
         test, batch_size=1, repeat=False, sort=False, train=False,
-        device=args.gpu[0] if args.gpu else None)
+        device=args.gpu[0] if args.gpu else -1)
 
     model = Seq2Seq(
         len(SRC.vocab), args.embed, args.encoder_hidden,
@@ -51,8 +54,8 @@ def main(args, logger):
 
     translate = model.translate
     if len(args.gpu) >= 2:
-        model = DataParallel(model, device_ids=args.gpu, dim=1)
-    if args.gpu:
+        model = DataParallel(model, device_ids=args.gpu, dim=1).cuda()
+    elif len(args.gpu) == 1:
         model.cuda(args.gpu[0])
 
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate,
