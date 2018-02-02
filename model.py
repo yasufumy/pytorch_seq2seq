@@ -183,7 +183,7 @@ class Seq2Seq(nn.Module):
         ys = self.decoder(ts_in, hs, encoder_state)
         # loss
         ts_out = ts[1:].view(-1)  # ignore bos
-        return self.nll_loss(ys, ts_out).unsqueeze(1)
+        return self.nll_loss(ys, ts_out).unsqueeze(0)
 
     def prepare_translation(self, bos_id, eos_id, id_to_token, max_length):
         self.bos_id = bos_id
