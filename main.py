@@ -18,8 +18,17 @@ BOS = '<s>'
 EOS = '</s>'
 
 
+def reverse_sentence(x):
+    return list(reversed(x))
+
+
 def main(args, logger):
-    SRC = data.Field(init_token=BOS, eos_token=EOS, include_lengths=True)
+    if args.reverse:
+        preprocessing = reverse_sentence
+    else:
+        preprocessing = None
+    SRC = data.Field(init_token=BOS, eos_token=EOS, include_lengths=True,
+                     preprocessing=preprocessing)
     TRG = data.Field(init_token=BOS, eos_token=EOS)
 
     if args.dataset == 'enja':
@@ -93,6 +102,7 @@ if __name__ == '__main__':
     parser.add_argument('--trg-vocab', type=int, default=5000)
     parser.add_argument('--decoder-hidden', type=int, default=512)
     parser.add_argument('--decoder-layers', type=int, default=1)
+    parser.add_argument('--reverse', action='store_true', default=False)
     parser.add_argument(
         '--attention-type', type=str, default='concat',
         choices=('general', 'concat', 'dot'))
