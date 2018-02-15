@@ -9,14 +9,16 @@ from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 class Linear(nn.Linear):
     def reset_parameters(self):
-        nn.init.xavier_uniform(self.weight)
+        # nn.init.xavier_uniform(self.weight)
+        nn.init.uniform(self.weight, a=-0.1, b=0.1)
         if self.bias is not None:
             nn.init.constant(self.bias, 0)
 
 
 class Embedding(nn.Embedding):
     def reset_parameters(self):
-        nn.init.xavier_uniform(self.weight)
+        # nn.init.xavier_uniform(self.weight)
+        nn.init.uniform(self.weight, a=-0.1, b=0.1)
         if self.padding_idx is not None:
             self.weight.data[self.padding_idx].fill_(0)
 
@@ -25,7 +27,8 @@ class LSTM(nn.LSTM):
     def reset_parameters(self):
         for name, param in self.named_parameters():
             if 'weight' in name:
-                nn.init.xavier_uniform(param)
+                # nn.init.xavier_uniform(param)
+                nn.init.uniform(param, a=-0.1, b=0.1)
             elif 'bias' in name:
                 nn.init.constant(param, 0)
 
@@ -67,9 +70,8 @@ class BaseAttention(nn.Module):
         src_lengths = src_lengths.view(-1)
         batch_size = src_lengths.numel()
         max_length = src_lengths.max()
-        self.mask = torch.arange(0, max_length).\
-            type_as(src_lengths).repeat(batch_size, 1).\
-            ge(src_lengths.unsqueeze(1))
+        self.mask = src_lengths.new(range(max_length)). \
+            repeat(batch_size, 1).ge(src_lengths.unsqueeze(1))
 
 
 class ConcatAttention(BaseAttention):
