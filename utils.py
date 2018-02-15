@@ -48,7 +48,7 @@ class TeacherForceUpdater:
             torch.nn.utils.clip_grad_norm(
                 self._model.parameters(), self._gradient_clipping)
         self._optimizer.step()
-        return loss.data[0] * xs.size(1)
+        return loss.data[0]
 
 
 class TeacherForceInference:
@@ -61,8 +61,8 @@ class TeacherForceInference:
         xs, src_lengths = batch.src
         src_lengths = Variable(src_lengths.unsqueeze(0), volatile=True)
         loss = self._infer_func(xs, src_lengths, batch.trg)
-        loss = torch.mean(loss)
-        return loss.data[0] * xs.size(1)
+        loss = torch.sum(loss)
+        return loss.data[0]
 
 
 class ComputeBleu:
