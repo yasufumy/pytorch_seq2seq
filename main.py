@@ -3,6 +3,7 @@ from operator import le
 import logging
 
 import torch.optim as optim
+from torch.optim.lr_scheduler import MultiStepLR
 from torch.nn import DataParallel
 from ignite.trainer import Trainer, TrainingEvents
 from ignite.handlers import Validate
@@ -18,8 +19,8 @@ BOS = '<s>'
 EOS = '</s>'
 
 
-def reverse_sentence(x):
-    return list(reversed(x))
+def reverse_sentence(xs):
+    return list(reversed(xs))
 
 
 def main(args, logger):
@@ -67,11 +68,18 @@ def main(args, logger):
     elif len(args.gpu) == 1:
         model.cuda(args.gpu[0])
 
-    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate,
-                           weight_decay=args.weight_decay)
+    if args.optim == 'adam':
+        optimizer = optim.Adam(model.parameters(), lr=args.learning_rate,
+                               weight_decay=args.weight_decay)
+        scheduler = None
+    elif args.optim == 'sgd':
+        optimizer = optim.SGD(model.parameters(), lr=args.learning_rate)
+        scheduler = MultiStepLR(
+            optimizer, milestones=list(range(7, 12)), gamma=0.5)
 
     trainer = Trainer(
-        TeacherForceUpdater(model, optimizer, model, args.gradient_clipping),
+        TeacherForceUpdater(
+            model, optimizer, model, args.gradient_clipping),
         TeacherForceInference(model, model))
     trainer.add_event_handler(TrainingEvents.EPOCH_COMPLETED,
                               Validate(val_iter, epoch_interval=1))
@@ -85,6 +93,9 @@ def main(args, logger):
     trainer.add_event_handler(TrainingEvents.TRAINING_COMPLETED,
                               ComputeBleu(model, test.trg, translate),
                               test_iter, args.best_file, logger)
+    if scheduler is not None:
+        trainer.add_event_handler(TrainingEvents.EPOCH_STARTED,
+                                  lambda trainer: scheduler.step())
     trainer.run(train_iter, max_epochs=args.epoch)
 
 
@@ -115,6 +126,8 @@ if __name__ == '__main__':
     parser.add_argument('--best-file', type=str, default='best.model')
     parser.add_argument('--dataset', type=str, default='enja',
                         choices=('enja', 'wmt14'))
+    parser.add_argument('--optim', type=str, default='adam',
+                        choices=('adam', 'sgd'))
     args = parser.parse_args()
 
     if args.log_file is not None:
