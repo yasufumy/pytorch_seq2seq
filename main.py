@@ -75,7 +75,7 @@ def main(args, logger):
     elif args.optim == 'sgd':
         optimizer = optim.SGD(model.parameters(), lr=args.learning_rate)
         scheduler = MultiStepLR(
-            optimizer, milestones=list(range(7, 12)), gamma=0.5)
+            optimizer, milestones=list(range(8, 12)), gamma=0.5)
 
     trainer = Trainer(
         TeacherForceUpdater(
