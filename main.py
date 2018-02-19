@@ -87,12 +87,14 @@ def main(args, logger):
                               log_training_average_nll, logger=logger)
     trainer.add_event_handler(TrainingEvents.VALIDATION_COMPLETED,
                               get_log_validation_ppl(val.trg), logger=logger)
-    trainer.add_event_handler(TrainingEvents.VALIDATION_COMPLETED,
-                              BestModelSnapshot(model, 'ppl', 1e10, le),
-                              args.best_file, logger)
+
     trainer.add_event_handler(TrainingEvents.TRAINING_COMPLETED,
                               ComputeBleu(model, test.trg, translate),
                               test_iter, args.best_file, logger)
+    if args.best_file is not None:
+        trainer.add_event_handler(TrainingEvents.VALIDATION_COMPLETED,
+                                  BestModelSnapshot(model, 'ppl', 1e10, le),
+                                  args.best_file, logger)
     if scheduler is not None:
         trainer.add_event_handler(TrainingEvents.EPOCH_STARTED,
                                   lambda trainer: scheduler.step())
@@ -123,7 +125,7 @@ if __name__ == '__main__':
     parser.add_argument('--gradient-clipping', type=int, default=5)
     parser.add_argument('--max-length', type=int, default=32)
     parser.add_argument('--log-file', type=str, default=None)
-    parser.add_argument('--best-file', type=str, default='best.model')
+    parser.add_argument('--best-file', type=str, default=None)
     parser.add_argument('--dataset', type=str, default='enja',
                         choices=('enja', 'wmt14'))
     parser.add_argument('--optim', type=str, default='adam',
