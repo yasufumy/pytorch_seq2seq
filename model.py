@@ -125,7 +125,6 @@ class LSTMDecoder(nn.Module):
         self.output = Linear(decoder_hidden_size, embeddings.num_embeddings)
         self.dropout_ratio = dropout_ratio
         self.num_layers = num_layers
-        self.num_directions = 1
 
     def forward_step(self, y, state, hs, feed):
         emb = self.embeddings(y)
@@ -141,7 +140,7 @@ class LSTMDecoder(nn.Module):
         length, batch_size = ts.size()
         feed = Variable(ts.data.new(batch_size, self.hidden_size).zero_().float(),
                         volatile=not self.training)
-        state = None
+        state = self.set_state(encoder_state)
         hs = hs.transpose(1, 0)  # transpose for attention
         ys = []
         for t in ts:
@@ -149,6 +148,18 @@ class LSTMDecoder(nn.Module):
             ys.append(y)
         ys = torch.cat(ys, 0)
         return functional.log_softmax(ys, dim=1).view(length * batch_size, -1)
+
+    def set_state(self, encoder_state):
+        h, c = encoder_state
+        stacks, batch_size, encoder_hidden_size = h.size()
+        if stacks == self.num_layers:
+            return (h, c)
+        elif stacks == 2 and self.num_layers == 1:
+            h = torch.sum(h, dim=0, keepdim=True)
+            c = torch.sum(c, dim=0, keepdim=True)
+            return (h, c)
+        else:
+            return None
 
 
 class Seq2Seq(nn.Module):
