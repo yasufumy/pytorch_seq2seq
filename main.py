@@ -5,8 +5,10 @@ import logging
 import torch.optim as optim
 from torch.optim.lr_scheduler import MultiStepLR
 from torch.nn import DataParallel
-from ignite.trainer import Trainer, TrainingEvents
-from ignite.handlers import Validate
+from ignite.trainer import Trainer
+from ignite.engine import Events
+from ignite.evaluator import Evaluator
+from ignite.handlers import Evaluate
 from torchtext import data
 from torchtext.datasets.translation import WMT14
 
@@ -77,26 +79,23 @@ def main(args, logger):
         scheduler = MultiStepLR(
             optimizer, milestones=list(range(8, 12)), gamma=0.5)
 
-    trainer = Trainer(
-        TeacherForceUpdater(
-            model, optimizer, model, args.gradient_clipping),
-        TeacherForceInference(model, model))
-    trainer.add_event_handler(TrainingEvents.EPOCH_COMPLETED,
-                              Validate(val_iter, epoch_interval=1))
-    trainer.add_event_handler(TrainingEvents.TRAINING_EPOCH_COMPLETED,
+    trainer = Trainer(TeacherForceUpdater(model, optimizer, model, args.gradient_clipping))
+    evaluator = Evaluator(TeacherForceInference(model, model))
+    trainer.add_event_handler(Events.EPOCH_COMPLETED,
                               log_training_average_nll, logger=logger)
-    trainer.add_event_handler(TrainingEvents.VALIDATION_COMPLETED,
-                              get_log_validation_ppl(val.trg), logger=logger)
-
-    trainer.add_event_handler(TrainingEvents.TRAINING_COMPLETED,
-                              ComputeBleu(model, test.trg, translate),
-                              test_iter, args.best_file, logger)
+    trainer.add_event_handler(Events.EPOCH_COMPLETED,
+                              Evaluate(evaluator, val_iter, epoch_interval=1))
+    evaluator.add_event_handler(Events.COMPLETED,
+                                get_log_validation_ppl(val.trg), logger=logger)
     if args.best_file is not None:
-        trainer.add_event_handler(TrainingEvents.VALIDATION_COMPLETED,
-                                  BestModelSnapshot(model, 'ppl', 1e10, le),
-                                  args.best_file, logger)
+        evaluator.add_event_handler(Events.COMPLETED,
+                                    BestModelSnapshot(model, 'ppl', 1e10, le),
+                                    args.best_file, logger)
+        trainer.add_event_handler(Events.COMPLETED,
+                                  ComputeBleu(model, test.trg, translate),
+                                  test_iter, args.best_file, logger)
     if scheduler is not None:
-        trainer.add_event_handler(TrainingEvents.EPOCH_STARTED,
+        trainer.add_event_handler(Events.EPOCH_STARTED,
                                   lambda trainer: scheduler.step())
     trainer.run(train_iter, max_epochs=args.epoch)
 
