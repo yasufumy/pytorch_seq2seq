@@ -5,27 +5,26 @@ from torch.autograd import Variable
 from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
 
 
-def log_training_average_nll(trainer, logger):
-    window_size = trainer.current_iteration
-    nnl = sum(trainer.training_history[-window_size:]) / window_size
+def log_training_average_nll(engine, logger):
+    window_size = engine.current_iteration
+    nnl = sum(engine.history[-window_size:]) / window_size
     log_str = 'Average NNL for Training Data: {:.4f}'.format(nnl)
     logger(log_str)
-    trainer.current_validation_iteration = 0
 
 
 def get_log_validation_ppl(val_data):
     num_validation_labels = sum(len(y) for y in val_data)
 
-    def log_validation_ppl(trainer, logger):
-        window_size = trainer.current_validation_iteration
-        ppl = math.exp(sum(trainer.validation_history[-window_size:]) /
+    def log_validation_ppl(engine, logger):
+        window_size = engine.current_iteration
+        ppl = math.exp(sum(engine.history[-window_size:]) /
                        num_validation_labels)
         log_str = 'Perplexity for Validation Data: {:.4f}'.format(ppl)
         logger(log_str)
         # TODO: update these lines below when state is added to trainer
-        if not getattr(trainer, 'state', None):
-            trainer.state = {}
-        trainer.state['ppl'] = ppl
+        if not getattr(engine, 'state', None):
+            engine.state = {}
+        engine.state['ppl'] = ppl
     return log_validation_ppl
 
 
@@ -71,7 +70,7 @@ class ComputeBleu:
         self._refs = [[y] for y in refs]
         self._translater = translater
 
-    def __call__(self, trainer, test_iter, filename, logger=print):
+    def __call__(self, engine, test_iter, filename, logger=print):
         self._model.load_state_dict(torch.load(filename))
         self._model.eval()
         hyps = []
@@ -90,8 +89,8 @@ class BestModelSnapshot:
         self._best_value = initial_value
         self._compare_func = compare_func
 
-    def __call__(self, trainer, filename, logger=print):
-        metric = trainer.state[self._metric]
+    def __call__(self, engine, filename, logger=print):
+        metric = engine.state[self._metric]
         if self._compare_func(metric, self._best_value):
             self._best_value = metric
             logger('Saving model to {}'.format(filename))
