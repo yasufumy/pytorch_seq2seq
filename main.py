@@ -59,10 +59,9 @@ def main(args, logger):
         len(SRC.vocab), args.embed, args.encoder_hidden,
         len(TRG.vocab), args.embed, args.decoder_hidden, args.encoder_layers,
         not args.encoder_unidirectional, args.decoder_layers,
-        SRC.vocab.stoi[SRC.pad_token], stoi[TRG.pad_token],
-        args.dropout_ratio, args.attention_type)
-    model.prepare_translation(stoi[TRG.init_token], stoi[TRG.eos_token],
-                              TRG.vocab.itos, args.max_length)
+        SRC.vocab.stoi[SRC.pad_token], stoi[TRG.pad_token], stoi[TRG.init_token],
+        stoi[TRG.eos_token], args.dropout_ratio, args.attention_type)
+    model.prepare_translation(TRG.vocab.itos, args.max_length)
 
     translate = model.translate
     if len(args.gpu) >= 2:
