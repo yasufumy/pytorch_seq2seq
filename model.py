@@ -166,8 +166,8 @@ class Seq2Seq(nn.Module):
     def __init__(self, source_vocab_size, source_embed_size, encoder_hidden_size,
                  target_vocab_size, target_embed_size, decoder_hidden_size,
                  encoder_layers, encoder_bidirectional, decoder_layers,
-                 encoder_pad_index, decoder_pad_index, dropout_ratio=0.5,
-                 attention_type='general'):
+                 encoder_pad_index, decoder_pad_index, decoder_bos_index,
+                 decoder_eos_index, dropout_ratio=0.5, attention_type='general'):
         super().__init__()
 
         source_embedding = Embedding(source_vocab_size, source_embed_size, padding_idx=encoder_pad_index)
@@ -186,21 +186,26 @@ class Seq2Seq(nn.Module):
         self.decoder = LSTMDecoder(in_size, decoder_hidden_size, target_embedding, attention,
                                    dropout_ratio, num_layers=decoder_layers)
         self.nll_loss = nn.NLLLoss(ignore_index=decoder_pad_index, reduce=False)
+        self.decoder_pad_index = decoder_pad_index
+        self.decoder_bos_index = decoder_bos_index
+        self.decoder_eos_index = decoder_eos_index
 
     def forward(self, xs, lengths, ts):
+        ts_in, ts_out = self._get_valid_target(ts)
         # encode
         hs, encoder_state = self.encoder(xs, lengths.data)
-        ts_in = ts[:-1]  # ignore eos
         # decode
         self.decoder.attention.set_mask(lengths.data)
         ys = self.decoder(ts_in, hs, encoder_state)
         # loss
-        ts_out = ts[1:].view(-1)  # ignore bos
         return self.nll_loss(ys, ts_out).unsqueeze(0)
 
-    def prepare_translation(self, bos_id, eos_id, id_to_token, max_length):
-        self.bos_id = bos_id
-        self.eos_id = eos_id
+    def _get_valid_target(self, ts):
+        ts_in = ts[:-1].clone()
+        ts_in.masked_fill_(ts_in == self.decoder_eos_index, self.decoder_pad_index)
+        return ts_in, ts[1:].view(-1)
+
+    def prepare_translation(self, id_to_token, max_length):
         self.id_to_token = id_to_token
         self.max_length = max_length
 
@@ -208,28 +213,28 @@ class Seq2Seq(nn.Module):
         batch_size = xs.size(1)
         hs, _ = self.encoder(xs, lengths)
         hs = hs.transpose(1, 0)  # transpose for attention
-        y = Variable(xs.data.new(batch_size).fill_(self.bos_id), volatile=True)
+        y = Variable(xs.data.new(batch_size).fill_(self.decoder_bos_index), volatile=True)
         self.decoder.attention.set_mask(lengths)
         feed = Variable(xs.data.new(batch_size, self.decoder.hidden_size).zero_().float(),
                         volatile=not self.training)
         state = None
         ys = []
         # decoding
+        decoder_eos_index = self.decoder_eos_index
         self.decoder.lstm.flatten_parameters()
         for _ in range(self.max_length):
             y, state, feed = self.decoder.forward_step(y, state, hs, feed)
             y = y.topk(1)[1].view(-1)
-            if (y.data == self.eos_id).all():
+            if (y.data == decoder_eos_index).all():
                 break
             ys.append(y.data)
         # transpose
         ys = torch.cat(ys, 0).view(-1, batch_size).transpose(0, 1)
         # remove eos id
         pick = partial(torch.topk, k=1) if ys.is_cuda else partial(torch.max, dim=0)
-        eos_id = self.eos_id
         results = []
         for y in ys:
-            indices = y == eos_id
+            indices = y == decoder_eos_index
             if indices.any():
                 i = pick(indices)[1][0]
                 y = y[:i]
