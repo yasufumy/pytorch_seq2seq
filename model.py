@@ -51,7 +51,7 @@ class LSTMEncoder(nn.Module):
         lengths = lengths.view(-1).tolist()
         packed_embs = pack_padded_sequence(embs, lengths)
         hs, state = self.lstm(packed_embs)
-        hs = pad_packed_sequence(hs)[0]
+        hs, _ = pad_packed_sequence(hs)
         return hs, state
 
 
@@ -70,8 +70,7 @@ class BaseAttention(nn.Module):
         src_lengths = src_lengths.view(-1)
         batch_size = src_lengths.numel()
         max_length = src_lengths.max()
-        self.mask = src_lengths.new(range(max_length)). \
-            repeat(batch_size, 1).ge(src_lengths.unsqueeze(1))
+        self.mask = src_lengths.new(range(max_length)).repeat(batch_size, 1).ge(src_lengths.unsqueeze(1))
 
 
 class ConcatAttention(BaseAttention):
@@ -128,8 +127,7 @@ class LSTMDecoder(nn.Module):
 
     def forward_step(self, y, state, hs, feed):
         emb = self.embeddings(y)
-        h, state = self.lstm(
-            torch.cat((emb, feed), 1).unsqueeze(0), state)
+        h, state = self.lstm(torch.cat((emb, feed), 1).unsqueeze(0), state)
         h = functional.dropout(h.squeeze(0), p=self.dropout_ratio)
         c = self.attention(h, hs)
         feed = functional.tanh(self.linear(torch.cat((c, h), 1)))
