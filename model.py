@@ -150,12 +150,11 @@ class LSTMDecoder(nn.Module):
     def set_state(self, encoder_state):
         h, c = encoder_state
         stacks, batch_size, encoder_hidden_size = h.size()
-        if stacks == self.num_layers:
-            return (h, c)
-        elif stacks == 2 and self.num_layers == 1:
-            h = torch.sum(h, dim=0, keepdim=True)
-            c = torch.sum(c, dim=0, keepdim=True)
-            return (h, c)
+        if stacks == self.num_layers and encoder_hidden_size == self.hidden_size:
+            return encoder_state
+        elif stacks == 2 and self.num_layers == 1 and encoder_hidden_size == 2 * self.hidden_size:
+            # feeding only forward state
+            return tuple(x[0][None] for x in encoder_state)
         else:
             return None
 
