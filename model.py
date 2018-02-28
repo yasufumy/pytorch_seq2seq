@@ -139,7 +139,7 @@ class LSTMDecoder(nn.Module):
         feed = Variable(ts.data.new(batch_size, self.hidden_size).zero_().float(),
                         volatile=not self.training)
         state = self.set_state(encoder_state)
-        hs = hs.transpose(1, 0)  # transpose for attention
+        hs = hs.transpose(1, 0)  # transpose for attention (batch first)
         ys = []
         for t in ts:
             y, state, feed = self.forward_step(t, state, hs, feed)
@@ -209,7 +209,7 @@ class Seq2Seq(nn.Module):
     def translate(self, xs, lengths):
         batch_size = xs.size(1)
         hs, _ = self.encoder(xs, lengths)
-        hs = hs.transpose(1, 0)  # transpose for attention
+        hs = hs.transpose(1, 0)  # transpose for attention (batch first)
         y = Variable(xs.data.new(batch_size).fill_(self.decoder_bos_index), volatile=True)
         self.decoder.attention.set_mask(lengths)
         feed = Variable(xs.data.new(batch_size, self.decoder.hidden_size).zero_().float(),
