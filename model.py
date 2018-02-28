@@ -92,10 +92,14 @@ class GeneralAttention(BaseAttention):
     def __init__(self, query_size, hidden_size):
         super().__init__()
 
-        self.linear = Linear(query_size, hidden_size, bias=False)
+        self.linear = Linear(hidden_size, query_size, bias=False)
 
     def score(self, query, hs):
-        return torch.bmm(hs, self.linear(query).unsqueeze(2)).squeeze(2)
+        _, query_size = query.size()
+        _, length, hidden_size = hs.size()
+        query = query.unsqueeze(1).expand(-1, 1, query_size)
+        hs = self.linear(hs.contiguous().view(-1, hidden_size)).view(-1, query_size, length)
+        return torch.bmm(query, hs).squeeze(1)
 
 
 class DotAttention(BaseAttention):
