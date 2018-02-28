@@ -110,7 +110,7 @@ class DotAttention(BaseAttention):
             raise ValueError('query_size and hidden_size should be equal')
 
     def score(self, query, hs):
-        return torch.bmm(hs, query.unsqueeze(2)).squeeze(2)
+        return torch.bmm(query.unsqueeze(1), hs.transpose(1, 2)).squeeze(1)
 
 
 class LSTMDecoder(nn.Module):
